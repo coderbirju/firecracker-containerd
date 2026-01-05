@@ -111,3 +111,84 @@ jobs:
           name: rootfs-image-${{ matrix.runner }}-${{ github.run_id }}
           path: tools/image-builder/rootfs.img
           retention-days: 7
+
+  runtime-integration-tests:
+    name: Runtime Integration Tests
+    needs: [setup, build-and-test]
+    # Only run on CodeBuild runners that have the required infrastructure
+    if: ${{ fromJSON(needs.setup.outputs.available-runners)[0] == 'ubuntu-x86' }}
+    runs-on: ${{ fromJSON(needs.setup.outputs.runner-labels)['ubuntu-x86'] }}
+    
+    env:
+      DOCKER_IMAGE_TAG: "${{ github.run_id }}"
+      NUMBER_OF_VMS: 10
+      EXTRAGOARGS: "-v -count=1 -race"
+      # Don't set FICD_DM_VOLUME_GROUP to use loopback device mapper mode
+      FICD_DM_POOL: "build_${{ github.run_id }}_runtime"
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-image-ubuntu-x86-${{ github.run_id }}
+          path: tools/image-builder/
+          
+      - name: Setup device mapper for integration tests
+        run: |
+          echo "=== Setting up device mapper infrastructure ==="
+          
+          # Install required packages for device mapper
+          sudo apt-get update
+          sudo apt-get install -y lvm2 thin-provisioning-tools bc
+          
+          # Check for KVM support
+          if [ ! -e /dev/kvm ]; then
+            echo "❌ /dev/kvm not available - Firecracker requires KVM"
+            echo "This is expected on standard GitHub runners, but should work on CodeBuild EC2 instances"
+            echo "If this fails consistently, we may need to enable nested virtualization on your CodeBuild fleet"
+            exit 1
+          else
+            echo "✅ /dev/kvm available"
+          fi
+          
+          # Check if we can access KVM
+          if ! sudo test -r /dev/kvm -a -w /dev/kvm; then
+            echo "❌ Cannot access /dev/kvm with required permissions"
+            ls -la /dev/kvm
+            exit 1
+          else
+            echo "✅ /dev/kvm accessible with required permissions"
+          fi
+          
+          # Create device mapper pool using loopback mode
+          echo "Creating device mapper thin pool: $FICD_DM_POOL"
+          ./tools/thinpool.sh create "$FICD_DM_POOL"
+          
+      - name: Run runtime integration tests
+        timeout-minutes: 15
+        run: |
+          echo "=== Running runtime integration tests ==="
+          echo "Device mapper pool: $FICD_DM_POOL"
+          echo "Number of VMs: $NUMBER_OF_VMS"
+          
+          # Run integration tests
+          make -C runtime integ-test FICD_DM_POOL="$FICD_DM_POOL"
+          
+      - name: Cleanup device mapper
+        if: always()
+        run: |
+          echo "=== Cleaning up device mapper resources ==="
+          ./tools/thinpool.sh remove "$FICD_DM_POOL" || echo "Pool removal failed, but continuing..."
+          
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-integration-logs-${{ github.run_id }}
+          path: runtime/logs/
+          retention-days: 7
