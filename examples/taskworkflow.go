@@ -69,7 +69,7 @@ func taskWorkflow(containerCIDR, gateway, snapshotter string) (err error) {
 	log.Println("Created containerd client")
 
 	ctx := namespaces.WithNamespace(context.Background(), namespaceName)
-	image, err := client.Pull(ctx, "docker.io/library/nginx:1.17-alpine",
+	image, err := client.Pull(ctx, "public.ecr.aws/docker/library/nginx:1.19.10-alpine",
 		containerd.WithPullUnpack,
 		containerd.WithPullSnapshotter(snapshotter),
 	)

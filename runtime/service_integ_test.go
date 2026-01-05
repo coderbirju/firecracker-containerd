@@ -101,11 +101,11 @@ func unpackImage(ctx context.Context, client *containerd.Client, snapshotterName
 }
 
 func alpineImage(ctx context.Context, client *containerd.Client, snapshotterName string) (containerd.Image, error) {
-	return unpackImage(ctx, client, snapshotterName, "docker.io/library/alpine:3.10.1")
+	return unpackImage(ctx, client, snapshotterName, "public.ecr.aws/docker/library/nginx:alpine3.19")
 }
 
 func iperf3Image(ctx context.Context, client *containerd.Client, snapshotterName string) (containerd.Image, error) {
-	return unpackImage(ctx, client, snapshotterName, "docker.io/mlabbe/iperf3:3.6-r0")
+	return unpackImage(ctx, client, snapshotterName, "public.ecr.aws/n1a9w1i5/mlabbe/iperf3:latest")
 }
 
 func TestShimExitsUponContainerDelete_Isolated(t *testing.T) {

@@ -17,7 +17,7 @@ sudo -E PATH=$PATH \
      --config $dir/config.toml &>> runtime/logs/containerd.out &
 containerd_pid=$!
 
-sudo $bin_path/firecracker-ctr --address $dir/containerd.sock content fetch docker.io/library/alpine:3.10.1
+sudo $bin_path/firecracker-ctr --address $dir/containerd.sock content fetch public.ecr.aws/docker/library/alpine:3.10.9
 
 TAP_PREFIX=build$BUILDKITE_BUILD_NUMBER \
      sudo -E PATH=$bin_path:$PATH /usr/local/bin/go test -count=1 -run TestMultipleVMs_Isolated ./... -v
