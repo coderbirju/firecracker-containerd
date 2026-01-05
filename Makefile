@@ -29,7 +29,7 @@ SUBMODULES=_submodules
 UID:=$(shell id -u)
 GID:=$(shell id -g)
 
-FIRECRACKER_CONTAINERD_BUILDER_IMAGE?=golang:1.24-bookworm
+FIRECRACKER_CONTAINERD_BUILDER_IMAGE?=public.ecr.aws/docker/library/golang:1.24-bookworm
 export FIRECRACKER_CONTAINERD_TEST_IMAGE?=localhost/firecracker-containerd-test
 export GO_CACHE_VOLUME_NAME?=gocache
 
@@ -176,7 +176,7 @@ test: $(TEST_SUBDIRS)
 # test-in-docker runs all unit tests inside a docker container. Use "integ-test" to
 # run the integ-tests inside containers.
 test-in-docker:
-	docker run --rm -it \
+	docker run --rm -i \
 		--user $(UID):$(GID) \
 		--volume $(CURDIR):/src \
 		--volume $(GO_CACHE_VOLUME_NAME):/go \
@@ -414,7 +414,7 @@ tools/stargz-builder-stamp: tools/docker/Dockerfile.stargz-builder
 	touch $@
 
 $(STARGZ_BIN): $(STARGZ_DIR)/go.mod tools/stargz-builder-stamp
-	docker run --rm -it \
+	docker run --rm -i \
 	--user $(UID):$(GID) \
 	--volume $(GO_CACHE_VOLUME_NAME):/go \
 	--volume $(CURDIR):/src \
