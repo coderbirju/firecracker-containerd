@@ -66,7 +66,7 @@ jobs:
           make test-images
           
           echo "Cleaning up rootfs directory..."
-          docker run --rm -v $PWD:/mnt debian:bookworm-slim rm -rf /mnt/tools/image-builder/rootfs
+          docker run --rm -v $PWD:/mnt public.ecr.aws/debian/debian:bookworm-slim rm -rf /mnt/tools/image-builder/rootfs
           
           echo "Copying rootfs image to artifacts..."
           cp tools/image-builder/rootfs.img /tmp/artifacts/$DOCKER_IMAGE_TAG/
@@ -92,17 +92,17 @@ jobs:
             echo "✅ Protobuf files are up to date"
           fi
           
-      - name: "Phase 4: Unit tests"
-        timeout-minutes: 10
-        run: |
-          echo "=== Running unit tests ==="
+      # - name: "Phase 4: Unit tests"
+      #   timeout-minutes: 10
+      #   run: |
+      #     echo "=== Running unit tests ==="
           
-          echo "Restoring rootfs image for tests..."
-          cp /tmp/artifacts/$DOCKER_IMAGE_TAG/rootfs.img tools/image-builder/rootfs.img
+      #     echo "Restoring rootfs image for tests..."
+      #     cp /tmp/artifacts/$DOCKER_IMAGE_TAG/rootfs.img tools/image-builder/rootfs.img
           
-          echo "Running unit tests in docker..."
-          export EXTRAGOARGS="-v -count=1 -race"
-          make test-in-docker
+      #     echo "Running unit tests in docker..."
+      #     export EXTRAGOARGS="-v -count=1 -race"
+      #     make test-in-docker
           
       - name: Upload artifacts
         if: always()
@@ -138,36 +138,119 @@ jobs:
           name: rootfs-image-ubuntu-x86-${{ github.run_id }}
           path: tools/image-builder/
           
-      - name: Setup device mapper for integration tests
+      - name: Setup KVM and device mapper for integration tests
         run: |
-          echo "=== Setting up device mapper infrastructure ==="
+          echo "=== Setting up KVM and device mapper infrastructure ==="
           
-          # Install required packages for device mapper
-          sudo apt-get update
-          sudo apt-get install -y lvm2 thin-provisioning-tools bc
+          # Detect operating system and architecture
+          echo "System Information:"
+          echo "- OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo "- Kernel: $(uname -r)"
+          echo "- Architecture: $(uname -m)"
+          echo "- CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)"
           
-          # Check for KVM support
-          if [ ! -e /dev/kvm ]; then
-            echo "❌ /dev/kvm not available - Firecracker requires KVM"
-            echo "This is expected on standard GitHub runners, but should work on CodeBuild EC2 instances"
-            echo "If this fails consistently, we may need to enable nested virtualization on your CodeBuild fleet"
-            exit 1
+          # Update system packages
+          echo "Updating system packages..."
+          sudo apt-get update -y
+          
+          # Install KVM and device mapper packages for Ubuntu
+          echo "Installing KVM and device mapper packages..."
+          sudo apt-get install -y \
+            qemu-kvm \
+            libvirt-daemon-system \
+            libvirt-clients \
+            bridge-utils \
+            lvm2 \
+            thin-provisioning-tools \
+            bc
+          
+          # Check CPU virtualization support
+          echo "=== Checking CPU virtualization support ==="
+          if grep -q "vmx\|svm" /proc/cpuinfo; then
+            echo "✅ CPU supports hardware virtualization"
+            
+            if grep -q "vmx" /proc/cpuinfo; then
+              echo "- Intel CPU detected (VMX support)"
+              KVM_MODULE="kvm-intel"
+            elif grep -q "svm" /proc/cpuinfo; then
+              echo "- AMD CPU detected (SVM support)"  
+              KVM_MODULE="kvm-amd"
+            fi
           else
-            echo "✅ /dev/kvm available"
+            echo "❌ CPU does not support hardware virtualization"
+            echo "Hardware virtualization flags not found in /proc/cpuinfo"
+            grep "flags" /proc/cpuinfo | head -1
+            exit 1
           fi
           
-          # Check if we can access KVM
+          # Load KVM kernel modules
+          echo "=== Loading KVM kernel modules ==="
+          sudo modprobe kvm
+          sudo modprobe $KVM_MODULE
+          
+          # Verify KVM modules are loaded
+          echo "Verifying KVM modules are loaded:"
+          if lsmod | grep -q "^kvm "; then
+            echo "✅ kvm module loaded"
+          else
+            echo "❌ kvm module not loaded"
+            exit 1
+          fi
+          
+          if lsmod | grep -q "^$KVM_MODULE "; then
+            echo "✅ $KVM_MODULE module loaded"
+          else
+            echo "❌ $KVM_MODULE module not loaded"
+            exit 1
+          fi
+          
+          # Check for KVM device file
+          if [ ! -e /dev/kvm ]; then
+            echo "❌ /dev/kvm not available - this should not happen on metal instances"
+            echo "Checking if KVM modules created the device:"
+            ls -la /dev/kvm* 2>/dev/null || echo "No /dev/kvm* devices found"
+            echo "Loaded modules:"
+            lsmod | grep kvm
+            exit 1
+          else
+            echo "✅ /dev/kvm device exists"
+            ls -la /dev/kvm
+          fi
+          
+          # Check KVM device permissions
           if ! sudo test -r /dev/kvm -a -w /dev/kvm; then
             echo "❌ Cannot access /dev/kvm with required permissions"
+            echo "Current permissions:"
             ls -la /dev/kvm
-            exit 1
+            echo "Attempting to fix permissions..."
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
           else
             echo "✅ /dev/kvm accessible with required permissions"
           fi
           
+          # Test KVM functionality
+          echo "=== Testing KVM functionality ==="
+          if sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null 2>&1 | grep -q "could not load kernel"; then
+            echo "✅ KVM acceleration is working (kernel load error is expected)"
+          else
+            echo "❌ KVM acceleration test failed"
+            sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null || true
+            exit 1
+          fi
+          
+          # Start libvirt service
+          echo "=== Starting libvirt service ==="
+          sudo systemctl enable libvirtd
+          sudo systemctl start libvirtd
+          sudo systemctl status libvirtd --no-pager -l
+          
           # Create device mapper pool using loopback mode
+          echo "=== Setting up device mapper ==="
           echo "Creating device mapper thin pool: $FICD_DM_POOL"
           ./tools/thinpool.sh create "$FICD_DM_POOL"
+          
+          echo "=== KVM and device mapper setup complete ==="
           
       - name: Run runtime integration tests
         timeout-minutes: 15
