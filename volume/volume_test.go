@@ -25,6 +25,11 @@ import (
 const mib = 1024 * 1024
 
 func TestCreateDiskImage(t *testing.T) {
+	// Skip test if /dev/loop-control is not available (e.g., in unprivileged Docker containers)
+	if _, err := os.Stat("/dev/loop-control"); os.IsNotExist(err) {
+		t.Skip("skipping test: /dev/loop-control not available (likely in unprivileged container)")
+	}
+
 	ctx := context.Background()
 
 	vs := &Set{}

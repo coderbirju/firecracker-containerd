@@ -36,8 +36,8 @@ func TestGuestVolumeFrom_Isolated(t *testing.T) {
 	integtest.Prepare(t, integtest.WithDefaultNetwork())
 	const (
 		vmID     = "default"
-		postgres = "docker.io/library/postgres:14.3"
-		alpine   = "docker.io/library/alpine:3.10.1"
+		postgres = "public.ecr.aws/docker/library/postgres:14.3"
+		alpine   = "public.ecr.aws/docker/library/alpine:3.10.9"
 		runtime  = "aws.firecracker"
 	)
 

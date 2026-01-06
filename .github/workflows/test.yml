@@ -1,0 +1,277 @@
+name: Firecracker Containerd CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  AWS_REGION: us-west-2
+
+jobs:
+  setup:
+    name: Setup Build Matrix
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - use-codebuild: ${{ github.repository_owner == 'coderbirju' }}
+            runs-on-names-cb: [ubuntu-x86]
+            runs-on-names-gh: [ubuntu-latest]
+            runner-labels:
+              ubuntu-latest: ubuntu-latest
+              ubuntu-x86: "codebuild-fccd-codebuild-${{ github.run_id }}-${{ github.run_attempt }}-ubuntu-7.0-large"
+    outputs:
+      available-runners: ${{ matrix.use-codebuild && toJSON(matrix.runs-on-names-cb) || toJSON(matrix.runs-on-names-gh) }}
+      runner-labels: ${{ toJSON(matrix.runner-labels) }}
+    steps:
+      - name: Dump Config
+        run: echo '${{ toJSON(matrix) }}'
+
+  build-and-test:
+    name: Build and Test
+    needs: setup
+    strategy:
+      matrix:
+        runner: ${{ fromJSON(needs.setup.outputs.available-runners) }}
+    runs-on: ${{ fromJSON(needs.setup.outputs.runner-labels)[matrix.runner] }}
+    
+    env:
+      DOCKER_IMAGE_TAG: "${{ github.run_id }}"
+      EXTRAGOARGS: "-race"
+      DISABLE_ROOT_TESTS: 1
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+                    
+      - name: Set up environment
+        run: |
+          echo "Build started on $(date)"
+          echo "Runner: ${{ matrix.runner }}"
+          echo "Docker image tag: $DOCKER_IMAGE_TAG"
+          
+          # Create artifacts directory (equivalent to /local/artifacts in Buildkite)
+          mkdir -p /tmp/artifacts/$DOCKER_IMAGE_TAG
+          
+          # Set Docker registry preference to avoid rate limits
+          echo "Using AWS ECR Public as primary registry to avoid Docker Hub rate limits"
+          
+      - name: "Phase 1: Build test images"
+        run: |
+          echo "=== Building test images ==="
+          make test-images
+          
+          echo "Cleaning up rootfs directory..."
+          docker run --rm -v $PWD:/mnt public.ecr.aws/debian/debian:bookworm-slim rm -rf /mnt/tools/image-builder/rootfs
+          
+          echo "Copying rootfs image to artifacts..."
+          cp tools/image-builder/rootfs.img /tmp/artifacts/$DOCKER_IMAGE_TAG/
+          
+      - name: "Phase 2: Loop device cleanup check"
+        run: |
+          echo "=== Checking for loop device leaks ==="
+          sudo losetup -l || echo "No losetup available or no loop devices"
+          
+      - name: "Phase 3: Verify proto files"
+        timeout-minutes: 1
+        run: |
+          echo "=== Verifying protobuf files ==="
+          make proto
+          
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "❌ Generated protobuf code differs from committed files"
+            git status
+            echo ""
+            echo "Generated protobuf code differs from committed, please run 'make proto' and commit the updated files."
+            exit 1
+          else
+            echo "✅ Protobuf files are up to date"
+          fi
+          
+      # - name: "Phase 4: Unit tests"
+      #   timeout-minutes: 10
+      #   run: |
+      #     echo "=== Running unit tests ==="
+          
+      #     echo "Restoring rootfs image for tests..."
+      #     cp /tmp/artifacts/$DOCKER_IMAGE_TAG/rootfs.img tools/image-builder/rootfs.img
+          
+      #     echo "Running unit tests in docker..."
+      #     export EXTRAGOARGS="-v -count=1 -race"
+      #     make test-in-docker
+          
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rootfs-image-${{ matrix.runner }}-${{ github.run_id }}
+          path: tools/image-builder/rootfs.img
+          retention-days: 7
+
+  runtime-integration-tests:
+    name: Runtime Integration Tests
+    needs: [setup, build-and-test]
+    # Only run on CodeBuild runners that have the required infrastructure
+    if: ${{ fromJSON(needs.setup.outputs.available-runners)[0] == 'ubuntu-x86' }}
+    runs-on: ${{ fromJSON(needs.setup.outputs.runner-labels)['ubuntu-x86'] }}
+    
+    env:
+      DOCKER_IMAGE_TAG: "${{ github.run_id }}"
+      NUMBER_OF_VMS: 10
+      EXTRAGOARGS: "-v -count=1 -race"
+      # Don't set FICD_DM_VOLUME_GROUP to use loopback device mapper mode
+      FICD_DM_POOL: "build_${{ github.run_id }}_runtime"
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-image-ubuntu-x86-${{ github.run_id }}
+          path: tools/image-builder/
+          
+      - name: Setup KVM and device mapper for integration tests
+        run: |
+          echo "=== Setting up KVM and device mapper infrastructure ==="
+          
+          # Detect operating system and architecture
+          echo "System Information:"
+          echo "- OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo "- Kernel: $(uname -r)"
+          echo "- Architecture: $(uname -m)"
+          echo "- CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)"
+          
+          # Update system packages
+          echo "Updating system packages..."
+          sudo apt-get update -y
+          
+          # Install KVM and device mapper packages for Ubuntu
+          echo "Installing KVM and device mapper packages..."
+          sudo apt-get install -y \
+            qemu-kvm \
+            libvirt-daemon-system \
+            libvirt-clients \
+            bridge-utils \
+            lvm2 \
+            thin-provisioning-tools \
+            bc
+          
+          # Check CPU virtualization support
+          echo "=== Checking CPU virtualization support ==="
+          if grep -q "vmx\|svm" /proc/cpuinfo; then
+            echo "✅ CPU supports hardware virtualization"
+            
+            if grep -q "vmx" /proc/cpuinfo; then
+              echo "- Intel CPU detected (VMX support)"
+              KVM_MODULE="kvm-intel"
+            elif grep -q "svm" /proc/cpuinfo; then
+              echo "- AMD CPU detected (SVM support)"  
+              KVM_MODULE="kvm-amd"
+            fi
+          else
+            echo "❌ CPU does not support hardware virtualization"
+            echo "Hardware virtualization flags not found in /proc/cpuinfo"
+            grep "flags" /proc/cpuinfo | head -1
+            exit 1
+          fi
+          
+          # Load KVM kernel modules
+          echo "=== Loading KVM kernel modules ==="
+          sudo modprobe kvm
+          sudo modprobe $KVM_MODULE
+          
+          # Verify KVM modules are loaded
+          echo "Verifying KVM modules are loaded:"
+          if lsmod | grep -q "^kvm "; then
+            echo "✅ kvm module loaded"
+          else
+            echo "❌ kvm module not loaded"
+            exit 1
+          fi
+          
+          if lsmod | grep -q "^$KVM_MODULE "; then
+            echo "✅ $KVM_MODULE module loaded"
+          else
+            echo "❌ $KVM_MODULE module not loaded"
+            exit 1
+          fi
+          
+          # Check for KVM device file
+          if [ ! -e /dev/kvm ]; then
+            echo "❌ /dev/kvm not available - this should not happen on metal instances"
+            echo "Checking if KVM modules created the device:"
+            ls -la /dev/kvm* 2>/dev/null || echo "No /dev/kvm* devices found"
+            echo "Loaded modules:"
+            lsmod | grep kvm
+            exit 1
+          else
+            echo "✅ /dev/kvm device exists"
+            ls -la /dev/kvm
+          fi
+          
+          # Check KVM device permissions
+          if ! sudo test -r /dev/kvm -a -w /dev/kvm; then
+            echo "❌ Cannot access /dev/kvm with required permissions"
+            echo "Current permissions:"
+            ls -la /dev/kvm
+            echo "Attempting to fix permissions..."
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
+          else
+            echo "✅ /dev/kvm accessible with required permissions"
+          fi
+          
+          # Test KVM functionality
+          echo "=== Testing KVM functionality ==="
+          if sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null 2>&1 | grep -q "could not load kernel"; then
+            echo "✅ KVM acceleration is working (kernel load error is expected)"
+          else
+            echo "❌ KVM acceleration test failed"
+            sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null || true
+            exit 1
+          fi
+          
+          # Start libvirt service
+          echo "=== Starting libvirt service ==="
+          sudo systemctl enable libvirtd
+          sudo systemctl start libvirtd
+          sudo systemctl status libvirtd --no-pager -l
+          
+          # Create device mapper pool using loopback mode
+          echo "=== Setting up device mapper ==="
+          echo "Creating device mapper thin pool: $FICD_DM_POOL"
+          ./tools/thinpool.sh create "$FICD_DM_POOL"
+          
+          echo "=== KVM and device mapper setup complete ==="
+          
+      - name: Run runtime integration tests
+        timeout-minutes: 15
+        run: |
+          echo "=== Running runtime integration tests ==="
+          echo "Device mapper pool: $FICD_DM_POOL"
+          echo "Number of VMs: $NUMBER_OF_VMS"
+          
+          # Run integration tests
+          make -C runtime integ-test FICD_DM_POOL="$FICD_DM_POOL"
+          
+      - name: Cleanup device mapper
+        if: always()
+        run: |
+          echo "=== Cleaning up device mapper resources ==="
+          ./tools/thinpool.sh remove "$FICD_DM_POOL" || echo "Pool removal failed, but continuing..."
+          
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-integration-logs-${{ github.run_id }}
+          path: runtime/logs/
+          retention-days: 7
