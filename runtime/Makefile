@@ -51,9 +51,12 @@ test:
 integ-test:
 	$(MAKE) $(addprefix integ-test-,$(INTEG_TESTNAMES))
 
+# Use -i only in CI environments, -it for local development
+TTY_FLAG := $(if $(CI),-i,-it)
+
 integ-test-%: logs
 	$(CURDIR)/../tools/thinpool.sh reset "$(FICD_DM_POOL)"
-	docker run --rm -it \
+	docker run --rm $(TTY_FLAG) \
 		--privileged \
 		--ipc=host \
 		--network=none \
@@ -75,7 +78,7 @@ integ-test-%: logs
 
 benchmark-%: logs
 	$(CURDIR)/../tools/thinpool.sh reset "$(FICD_DM_POOL)"
-	docker run --rm -it \
+	docker run --rm $(TTY_FLAG) \
 		--privileged \
 		--ipc=host \
 		--network=none \
@@ -117,7 +120,7 @@ perf-test:
 	$(if $(PERF_PLUGIN_NAME),true,$(error PERF_PLUGIN_NAME must be set for perf-test target))
 	mkdir -p $(CURDIR)/logs
 
-	docker run --rm -it \
+	docker run --rm $(TTY_FLAG) \
 		--privileged \
 		--ipc=host \
 		--network=none \
@@ -144,7 +147,7 @@ perf-test:
 .PHONY: critest
 critest:
 	$(CURDIR)/../tools/thinpool.sh reset "$(FICD_DM_POOL)"
-	docker run --rm -it \
+	docker run --rm $(TTY_FLAG) \
 		--privileged \
 		--ipc=host \
 		--volume /dev:/dev \

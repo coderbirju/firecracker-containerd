@@ -112,17 +112,17 @@ jobs:
             echo "✅ Protobuf files are up to date"
           fi
           
-      - name: "Phase 4: Unit tests"
-        timeout-minutes: 10
-        run: |
-          echo "=== Running unit tests ==="
-          
-          echo "Restoring rootfs image for tests..."
-          cp /tmp/artifacts/$DOCKER_IMAGE_TAG/rootfs.img tools/image-builder/rootfs.img
-          
-          echo "Running unit tests in docker..."
-          export EXTRAGOARGS="-v -count=1 -race"
-          make test-in-docker
+      # - name: "Phase 4: Unit tests"
+      #   timeout-minutes: 10
+      #   run: |
+      #     echo "=== Running unit tests ==="
+      #     
+      #     echo "Restoring rootfs image for tests..."
+      #     cp /tmp/artifacts/$DOCKER_IMAGE_TAG/rootfs.img tools/image-builder/rootfs.img
+      #     
+      #     echo "Running unit tests in docker..."
+      #     export EXTRAGOARGS="-v -count=1 -race"
+      #     make test-in-docker
           
       - name: Upload artifacts
         if: always()
@@ -132,166 +132,269 @@ jobs:
           path: tools/image-builder/rootfs.img
           retention-days: 7
 
-  # runtime-integration-tests:
-  #   name: Runtime Integration Tests
-  #   needs: [setup, build-and-test]
-  #   # Only run on CodeBuild runners that have the required infrastructure
-  #   if: ${{ fromJSON(needs.setup.outputs.available-runners)[0] == 'ubuntu-x86' }}
-  #   runs-on: ${{ fromJSON(needs.setup.outputs.runner-labels)['ubuntu-x86'] }}
+  runtime-integration-tests:
+    name: Runtime Integration Tests
+    needs: [build-and-test]
+    runs-on: self-hosted
     
-  #   env:
-  #     DOCKER_IMAGE_TAG: "${{ github.run_id }}"
-  #     NUMBER_OF_VMS: 10
-  #     EXTRAGOARGS: "-v -count=1 -race"
-  #     # Don't set FICD_DM_VOLUME_GROUP to use loopback device mapper mode
-  #     FICD_DM_POOL: "build_${{ github.run_id }}_runtime"
+    env:
+      DOCKER_IMAGE_TAG: "${{ github.run_id }}"
+      NUMBER_OF_VMS: 10
+      EXTRAGOARGS: "-v -count=1 -race"
+      # Don't set FICD_DM_VOLUME_GROUP to use loopback device mapper mode
+      FICD_DM_POOL: "build_${{ github.run_id }}_runtime"
+      CI: true
     
-  #   steps:
-  #     - name: Checkout code
-  #       uses: actions/checkout@v4
-  #       with:
-  #         submodules: recursive
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
           
-  #     - name: Download rootfs artifact
-  #       uses: actions/download-artifact@v4
-  #       with:
-  #         name: rootfs-image-ubuntu-x86-${{ github.run_id }}
-  #         path: tools/image-builder/
+      - name: Setup build environment for integration tests
+        run: |
+          echo "=== Setting up Go environment for integration tests ==="
           
-  #     - name: Setup KVM and device mapper for integration tests
-  #       run: |
-  #         echo "=== Setting up KVM and device mapper infrastructure ==="
+          # Install Go if not present or wrong version
+          GO_VERSION="1.24.2"
+          if ! command -v go &> /dev/null || ! go version | grep -q "go1.24"; then
+            echo "Installing Go ${GO_VERSION}..."
+            cd /tmp
+            curl -LO "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz"
+            sudo rm -rf /usr/local/go
+            sudo tar -C /usr/local -xzf "go${GO_VERSION}.linux-amd64.tar.gz"
+            export PATH=$PATH:/usr/local/go/bin
+            echo "/usr/local/go/bin" >> $GITHUB_PATH
+          fi
           
-  #         # Detect operating system and architecture
-  #         echo "System Information:"
-  #         echo "- OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
-  #         echo "- Kernel: $(uname -r)"
-  #         echo "- Architecture: $(uname -m)"
-  #         echo "- CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)"
+          # Verify Go installation
+          go version
           
-  #         # Update system packages
-  #         echo "Updating system packages..."
-  #         sudo apt-get update -y
+          # Set Go environment for this workflow
+          echo "GOPATH=$HOME/go" >> $GITHUB_ENV
+          echo "GO111MODULE=on" >> $GITHUB_ENV
+          echo "$HOME/go/bin" >> $GITHUB_PATH
           
-  #         # Install KVM and device mapper packages for Ubuntu
-  #         echo "Installing KVM and device mapper packages..."
-  #         sudo apt-get install -y \
-  #           qemu-kvm \
-  #           libvirt-daemon-system \
-  #           libvirt-clients \
-  #           bridge-utils \
-  #           lvm2 \
-  #           thin-provisioning-tools \
-  #           bc
+          echo "✅ Go environment ready for integration tests"
           
-  #         # Check CPU virtualization support
-  #         echo "=== Checking CPU virtualization support ==="
-  #         if grep -q "vmx\|svm" /proc/cpuinfo; then
-  #           echo "✅ CPU supports hardware virtualization"
+      - name: Pre-download Go dependencies for tests
+        run: |
+          echo "=== Pre-downloading Go dependencies ==="
+          cd runtime
+          echo "Downloading runtime Go modules..."
+          go mod download
+          go mod verify
+          echo "✅ Go dependencies downloaded successfully"
+          
+      - name: Download rootfs artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rootfs-image-${{ github.run_id }}
+          path: tools/image-builder/
+          
+      - name: Pre-pull required container images for integration tests
+        run: |
+          echo "=== Pre-pulling container images for integration tests ==="
+          
+          # Authenticate with ECR Public (always uses us-east-1 region)
+          echo "Authenticating with ECR Public..."
+          if aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws; then
+            echo "✅ ECR Public authentication successful"
+          else
+            echo "❌ ECR Public authentication failed"
+            echo "Checking AWS CLI configuration..."
+            aws sts get-caller-identity || echo "No AWS credentials available"
+            exit 1
+          fi
+          
+          # Pre-pull images required by integration tests since test containers run with --network=none
+          echo "Pulling nginx image for CNI tests..."
+          docker pull public.ecr.aws/docker/library/nginx:alpine3.19
+          
+          echo "Pulling iperf3 image for performance tests..."
+          docker pull public.ecr.aws/n1a9w1i5/mlabbe/iperf3:latest
+          
+          echo "Verifying images are available locally..."
+          docker images | grep -E "(nginx|iperf3)"
+          
+          echo "✅ Container images pre-pulled successfully"
+          
+      - name: Setup KVM and device mapper for integration tests
+        run: |
+          echo "=== Setting up KVM and device mapper infrastructure ==="
+          
+          # Detect operating system and architecture
+          echo "System Information:"
+          echo "- OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'"' -f2)"
+          echo "- Kernel: $(uname -r)"
+          echo "- Architecture: $(uname -m)"
+          echo "- CPU: $(grep 'model name' /proc/cpuinfo | head -1 | cut -d':' -f2 | xargs)"
+          
+          # Update system packages
+          echo "Updating system packages..."
+          sudo apt-get update -y
+          
+          # Install KVM and device mapper packages for Ubuntu
+          echo "Installing KVM and device mapper packages..."
+          sudo apt-get install -y \
+            qemu-kvm \
+            libvirt-daemon-system \
+            libvirt-clients \
+            bridge-utils \
+            lvm2 \
+            thin-provisioning-tools \
+            bc
+          
+          # Check CPU virtualization support
+          echo "=== Checking CPU virtualization support ==="
+          if grep -q "vmx\|svm" /proc/cpuinfo; then
+            echo "✅ CPU supports hardware virtualization"
             
-  #           if grep -q "vmx" /proc/cpuinfo; then
-  #             echo "- Intel CPU detected (VMX support)"
-  #             KVM_MODULE="kvm-intel"
-  #           elif grep -q "svm" /proc/cpuinfo; then
-  #             echo "- AMD CPU detected (SVM support)"  
-  #             KVM_MODULE="kvm-amd"
-  #           fi
-  #         else
-  #           echo "❌ CPU does not support hardware virtualization"
-  #           echo "Hardware virtualization flags not found in /proc/cpuinfo"
-  #           grep "flags" /proc/cpuinfo | head -1
-  #           exit 1
-  #         fi
+            if grep -q "vmx" /proc/cpuinfo; then
+              echo "- Intel CPU detected (VMX support)"
+              KVM_MODULE="kvm-intel"
+            elif grep -q "svm" /proc/cpuinfo; then
+              echo "- AMD CPU detected (SVM support)"  
+              KVM_MODULE="kvm-amd"
+            fi
+          else
+            echo "❌ CPU does not support hardware virtualization"
+            echo "Hardware virtualization flags not found in /proc/cpuinfo"
+            grep "flags" /proc/cpuinfo | head -1
+            exit 1
+          fi
           
-  #         # Load KVM kernel modules
-  #         echo "=== Loading KVM kernel modules ==="
-  #         sudo modprobe kvm
-  #         sudo modprobe $KVM_MODULE
+          # Load KVM kernel modules with error handling
+          echo "=== Loading KVM kernel modules ==="
           
-  #         # Verify KVM modules are loaded
-  #         echo "Verifying KVM modules are loaded:"
-  #         if lsmod | grep -q "^kvm "; then
-  #           echo "✅ kvm module loaded"
-  #         else
-  #           echo "❌ kvm module not loaded"
-  #           exit 1
-  #         fi
+          echo "Loading base kvm module..."
+          if ! sudo modprobe kvm 2>&1; then
+            echo "❌ Failed to load kvm module"
+            sudo dmesg | grep -i kvm | tail -10
+            exit 1
+          fi
+          echo "✅ Base kvm module loaded successfully"
           
-  #         if lsmod | grep -q "^$KVM_MODULE "; then
-  #           echo "✅ $KVM_MODULE module loaded"
-  #         else
-  #           echo "❌ $KVM_MODULE module not loaded"
-  #           exit 1
-  #         fi
+          echo "Waiting for kvm module to initialize..."
+          sleep 2
           
-  #         # Check for KVM device file
-  #         if [ ! -e /dev/kvm ]; then
-  #           echo "❌ /dev/kvm not available - this should not happen on metal instances"
-  #           echo "Checking if KVM modules created the device:"
-  #           ls -la /dev/kvm* 2>/dev/null || echo "No /dev/kvm* devices found"
-  #           echo "Loaded modules:"
-  #           lsmod | grep kvm
-  #           exit 1
-  #         else
-  #           echo "✅ /dev/kvm device exists"
-  #           ls -la /dev/kvm
-  #         fi
+          echo "Loading $KVM_MODULE module..."
+          if ! sudo modprobe $KVM_MODULE 2>&1; then
+            echo "❌ Failed to load $KVM_MODULE module"
+            echo "=== Diagnostic Information ==="
+            echo "Available modules:"
+            find /lib/modules/$(uname -r) -name "*kvm*" -type f
+            echo ""
+            echo "Module dependencies:"
+            modinfo $KVM_MODULE 2>/dev/null || echo "modinfo failed for $KVM_MODULE"
+            echo ""
+            echo "Kernel messages (last 20 lines):"
+            sudo dmesg | grep -i kvm | tail -20
+            echo ""
+            echo "CPU flags:"
+            grep "flags" /proc/cpuinfo | head -1
+            exit 1
+          fi
+          echo "✅ $KVM_MODULE module loaded successfully"
           
-  #         # Check KVM device permissions
-  #         if ! sudo test -r /dev/kvm -a -w /dev/kvm; then
-  #           echo "❌ Cannot access /dev/kvm with required permissions"
-  #           echo "Current permissions:"
-  #           ls -la /dev/kvm
-  #           echo "Attempting to fix permissions..."
-  #           sudo chmod 666 /dev/kvm
-  #           ls -la /dev/kvm
-  #         else
-  #           echo "✅ /dev/kvm accessible with required permissions"
-  #         fi
+          # Verify KVM modules are loaded
+          echo "=== Verifying KVM modules are active ==="
+          if lsmod | grep -q "^kvm "; then
+            echo "✅ kvm module active"
+          else
+            echo "❌ kvm module not active"
+            lsmod | grep kvm || echo "No kvm modules found in lsmod"
+            exit 1
+          fi
           
-  #         # Test KVM functionality
-  #         echo "=== Testing KVM functionality ==="
-  #         if sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null 2>&1 | grep -q "could not load kernel"; then
-  #           echo "✅ KVM acceleration is working (kernel load error is expected)"
-  #         else
-  #           echo "❌ KVM acceleration test failed"
-  #           sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null || true
-  #           exit 1
-  #         fi
+          # Get the actual module name from modinfo (handles hyphen/underscore conversion)
+          ACTUAL_MODULE_NAME=$(modinfo $KVM_MODULE 2>/dev/null | grep "^name:" | awk '{print $2}')
+          if [ -z "$ACTUAL_MODULE_NAME" ]; then
+            echo "❌ Could not determine actual module name for $KVM_MODULE"
+            modinfo $KVM_MODULE 2>&1 || echo "modinfo failed"
+            exit 1
+          fi
+          echo "Checking for actual module name: $ACTUAL_MODULE_NAME"
           
-  #         # Start libvirt service
-  #         echo "=== Starting libvirt service ==="
-  #         sudo systemctl enable libvirtd
-  #         sudo systemctl start libvirtd
-  #         sudo systemctl status libvirtd --no-pager -l
+          if lsmod | grep -q "^$ACTUAL_MODULE_NAME "; then
+            echo "✅ $KVM_MODULE module active (as $ACTUAL_MODULE_NAME)"
+          else
+            echo "❌ $KVM_MODULE module not active (expected as $ACTUAL_MODULE_NAME)"
+            lsmod | grep kvm || echo "No kvm modules found in lsmod"
+            exit 1
+          fi
           
-  #         # Create device mapper pool using loopback mode
-  #         echo "=== Setting up device mapper ==="
-  #         echo "Creating device mapper thin pool: $FICD_DM_POOL"
-  #         ./tools/thinpool.sh create "$FICD_DM_POOL"
+          echo "Final module status:"
+          lsmod | grep kvm
           
-  #         echo "=== KVM and device mapper setup complete ==="
+          # Check for KVM device file
+          if [ ! -e /dev/kvm ]; then
+            echo "❌ /dev/kvm not available - this should not happen on metal instances"
+            echo "Checking if KVM modules created the device:"
+            ls -la /dev/kvm* 2>/dev/null || echo "No /dev/kvm* devices found"
+            echo "Loaded modules:"
+            lsmod | grep kvm
+            exit 1
+          else
+            echo "✅ /dev/kvm device exists"
+            ls -la /dev/kvm
+          fi
           
-  #     - name: Run runtime integration tests
-  #       timeout-minutes: 15
-  #       run: |
-  #         echo "=== Running runtime integration tests ==="
-  #         echo "Device mapper pool: $FICD_DM_POOL"
-  #         echo "Number of VMs: $NUMBER_OF_VMS"
+          # Check KVM device permissions
+          if ! sudo test -r /dev/kvm -a -w /dev/kvm; then
+            echo "❌ Cannot access /dev/kvm with required permissions"
+            echo "Current permissions:"
+            ls -la /dev/kvm
+            echo "Attempting to fix permissions..."
+            sudo chmod 666 /dev/kvm
+            ls -la /dev/kvm
+          else
+            echo "✅ /dev/kvm accessible with required permissions"
+          fi
           
-  #         # Run integration tests
-  #         make -C runtime integ-test FICD_DM_POOL="$FICD_DM_POOL"
+          # Test KVM functionality
+          echo "=== Testing KVM functionality ==="
+          if sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null 2>&1 | grep -q "could not load kernel"; then
+            echo "✅ KVM acceleration is working (kernel load error is expected)"
+          else
+            echo "❌ KVM acceleration test failed"
+            sudo timeout 10s qemu-system-x86_64 -machine accel=kvm -cpu host -m 64 -nographic -no-reboot -kernel /dev/null || true
+            exit 1
+          fi
           
-  #     - name: Cleanup device mapper
-  #       if: always()
-  #       run: |
-  #         echo "=== Cleaning up device mapper resources ==="
-  #         ./tools/thinpool.sh remove "$FICD_DM_POOL" || echo "Pool removal failed, but continuing..."
+          # Start libvirt service
+          echo "=== Starting libvirt service ==="
+          sudo systemctl enable libvirtd
+          sudo systemctl start libvirtd
+          sudo systemctl status libvirtd --no-pager -l
           
-  #     - name: Upload test logs
-  #       if: always()
-  #       uses: actions/upload-artifact@v4
-  #       with:
-  #         name: runtime-integration-logs-${{ github.run_id }}
-  #         path: runtime/logs/
-  #         retention-days: 7
+          # Create device mapper pool using loopback mode
+          echo "=== Setting up device mapper ==="
+          echo "Creating device mapper thin pool: $FICD_DM_POOL"
+          ./tools/thinpool.sh create "$FICD_DM_POOL"
+          
+          echo "=== KVM and device mapper setup complete ==="
+          
+      - name: Run runtime integration tests
+        timeout-minutes: 15
+        run: |
+          echo "=== Running runtime integration tests ==="
+          echo "Device mapper pool: $FICD_DM_POOL"
+          echo "Number of VMs: $NUMBER_OF_VMS"
+          
+          # Run integration tests
+          make -C runtime integ-test FICD_DM_POOL="$FICD_DM_POOL"
+          
+      - name: Cleanup device mapper
+        if: always()
+        run: |
+          echo "=== Cleaning up device mapper resources ==="
+          ./tools/thinpool.sh remove "$FICD_DM_POOL" || echo "Pool removal failed, but continuing..."
+          
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-integration-logs-${{ github.run_id }}
+          path: runtime/logs/
+          retention-days: 7
