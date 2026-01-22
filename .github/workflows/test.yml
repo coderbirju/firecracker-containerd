@@ -77,6 +77,21 @@ jobs:
           # Set Docker registry preference to avoid rate limits
           echo "Using AWS ECR Public as primary registry to avoid Docker Hub rate limits"
           
+      - name: Authenticate with ECR Public for build images
+        run: |
+          echo "=== Authenticating with ECR Public for build phase ==="
+          
+          # Authenticate with ECR Public (always uses us-east-1 region)
+          echo "Authenticating with ECR Public..."
+          if aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws; then
+            echo "✅ ECR Public authentication successful"
+          else
+            echo "❌ ECR Public authentication failed"
+            echo "Checking AWS CLI configuration..."
+            aws sts get-caller-identity || echo "No AWS credentials available"
+            exit 1
+          fi
+          
       - name: "Phase 1: Build test images"
         run: |
           echo "=== Building test images ==="
@@ -179,12 +194,20 @@ jobs:
           
       - name: Pre-download Go dependencies for tests
         run: |
-          echo "=== Pre-downloading Go dependencies ==="
-          cd runtime
-          echo "Downloading runtime Go modules..."
-          go mod download
-          go mod verify
-          echo "✅ Go dependencies downloaded successfully"
+          echo "=== Pre-downloading Go dependencies into Docker volume ==="
+          
+          # Download dependencies into the same Docker volume used by tests
+          # This ensures the test container (which runs with --network=none) has all deps
+          docker run --rm \
+            --volume $(pwd):/src \
+            --volume gocache:/go \
+            --workdir=/src/runtime \
+            --env GOPROXY=direct \
+            --env GOSUMDB=off \
+            golang:1.24.2 \
+            sh -c "go mod download && go mod verify"
+          
+          echo "✅ Go dependencies downloaded successfully into Docker volume"
           
       - name: Download rootfs artifact
         uses: actions/download-artifact@v4
@@ -192,32 +215,6 @@ jobs:
           name: rootfs-image-${{ github.run_id }}
           path: tools/image-builder/
           
-      - name: Pre-pull required container images for integration tests
-        run: |
-          echo "=== Pre-pulling container images for integration tests ==="
-          
-          # Authenticate with ECR Public (always uses us-east-1 region)
-          echo "Authenticating with ECR Public..."
-          if aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws; then
-            echo "✅ ECR Public authentication successful"
-          else
-            echo "❌ ECR Public authentication failed"
-            echo "Checking AWS CLI configuration..."
-            aws sts get-caller-identity || echo "No AWS credentials available"
-            exit 1
-          fi
-          
-          # Pre-pull images required by integration tests since test containers run with --network=none
-          echo "Pulling nginx image for CNI tests..."
-          docker pull public.ecr.aws/docker/library/nginx:alpine3.19
-          
-          echo "Pulling iperf3 image for performance tests..."
-          docker pull public.ecr.aws/n1a9w1i5/mlabbe/iperf3:latest
-          
-          echo "Verifying images are available locally..."
-          docker images | grep -E "(nginx|iperf3)"
-          
-          echo "✅ Container images pre-pulled successfully"
           
       - name: Setup KVM and device mapper for integration tests
         run: |

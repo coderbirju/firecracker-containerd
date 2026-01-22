@@ -60,7 +60,7 @@ RUN --mount=type=bind,target=/src \
   ln -sv /usr/local/bin/firecracker-ctr /usr/local/bin/ctr
 
 RUN containerd 2>/dev/null & \
-  ctr --address /run/firecracker-containerd/containerd.sock content fetch public.ecr.aws/docker/library/alpine:3.10.9 >/dev/null && \
+  ctr --address /run/firecracker-containerd/containerd.sock content fetch public.ecr.aws/docker/library/nginx:alpine3.19 >/dev/null && \
   ctr --address /run/firecracker-containerd/containerd.sock content fetch public.ecr.aws/n1a9w1i5/mlabbe/iperf3:latest >/dev/null && \
   ctr --address /run/firecracker-containerd/containerd.sock content fetch public.ecr.aws/docker/library/postgres:14.3 >/dev/null
 
