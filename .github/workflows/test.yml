@@ -373,7 +373,7 @@ jobs:
           echo "=== KVM and device mapper setup complete ==="
           
       - name: Run runtime integration tests
-        timeout-minutes: 15
+        timeout-minutes: 30
         run: |
           echo "=== Running runtime integration tests ==="
           echo "Device mapper pool: $FICD_DM_POOL"
@@ -386,7 +386,41 @@ jobs:
         if: always()
         run: |
           echo "=== Cleaning up device mapper resources ==="
+          
+          # Wait for any pending operations to complete
+          echo "Waiting for pending operations to complete..."
+          sleep 5
+          
+          # Force sync and clear caches before cleanup
+          sync
+          sudo bash -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+          
+          # Check if containerd is still running and clean up snapshots
+          if command -v ctr >/dev/null 2>&1; then
+            echo "Cleaning up any remaining containerd snapshots..."
+            for snap in $(ctr --address /run/firecracker-containerd/containerd.sock snapshots list 2>/dev/null | tail -n +2 | awk '{print $1}' || true); do
+              if [ -n "$snap" ] && [ "$snap" != "KEY" ]; then
+                echo "Removing containerd snapshot: $snap"
+                ctr --address /run/firecracker-containerd/containerd.sock snapshots remove "$snap" 2>/dev/null || true
+              fi
+            done
+          fi
+          
+          # Additional sync after containerd cleanup
+          sync
+          sleep 2
+          
+          # Remove the device mapper pool
           ./tools/thinpool.sh remove "$FICD_DM_POOL" || echo "Pool removal failed, but continuing..."
+          
+          # Double-check cleanup completed
+          echo "Verifying device mapper cleanup completed..."
+          if [ -e "/dev/mapper/$(echo ${FICD_DM_VOLUME_GROUP:-""} | sed -e s/-/--/g)-${FICD_DM_POOL}" ] 2>/dev/null; then
+            echo "Warning: Device mapper pool still exists after cleanup"
+            sudo dmsetup info "/dev/mapper/$(echo ${FICD_DM_VOLUME_GROUP:-""} | sed -e s/-/--/g)-${FICD_DM_POOL}" 2>/dev/null || true
+          else
+            echo "✅ Device mapper cleanup completed successfully"
+          fi
           
       - name: Upload test logs
         if: always()

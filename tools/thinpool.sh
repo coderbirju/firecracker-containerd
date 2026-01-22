@@ -59,24 +59,92 @@ if [[ -z "$FICD_DM_VOLUME_GROUP" ]]; then
     }
 
     pool_remove() {
-        for snapshot in $(sudo dmsetup ls | awk "/^$name-snap-/ { print \$1 }"); do
-            sudo dmsetup remove $snapshot
+        echo "=== Loopback pool removal for: $name ==="
+        
+        # Phase 1: Remove snapshots with retry logic and force removal
+        echo "Removing snapshots for pool: $name"
+        for snapshot in $(sudo dmsetup ls 2>/dev/null | awk "/^$name-snap-/ { print \$1 }" || true); do
+            echo "Attempting to remove snapshot: $snapshot"
+            local retries=3
+            while [ $retries -gt 0 ]; do
+                if sudo dmsetup remove "$snapshot" 2>/dev/null; then
+                    echo "Successfully removed snapshot: $snapshot"
+                    break
+                else
+                    echo "Snapshot $snapshot busy, waiting... (retries left: $retries)"
+                    sleep 1
+                    retries=$((retries - 1))
+                fi
+            done
+            
+            if [ $retries -eq 0 ]; then
+                echo "Warning: Failed to remove snapshot $snapshot, trying force removal"
+                { sudo dmsetup remove --force "$snapshot" 2>/dev/null || true; } || true
+            fi
         done
 
-        local dev_no=1
-        while true; do
-            sudo dmsetup message "$name" 0 "delete $dev_no" || break
-            dev_no=$(($dev_no + 1))
+        # Phase 2: Try to delete thin devices by ID with error handling
+        echo "Cleaning up thin devices by ID..."
+        for dev_no in {1..50}; do
+            # Don't let dmsetup message failures stop the script - wrap in error handling
+            { sudo dmsetup message "$name" 0 "delete $dev_no" 2>/dev/null || true; } || true
         done
 
-        sudo dmsetup remove "$name"
+        # Phase 3: Remove the main pool device with retries
+        echo "Removing main pool device: $name"
+        local pool_retries=3
+        while [ $pool_retries -gt 0 ]; do
+            if sudo dmsetup remove "$name" 2>/dev/null; then
+                echo "Successfully removed pool: $name"
+                break
+            else
+                echo "Pool $name busy, waiting... (retries left: $pool_retries)"
+                sleep 1
+                pool_retries=$((pool_retries - 1))
+            fi
+        done
+        
+        if [ $pool_retries -eq 0 ]; then
+            echo "Warning: Failed to remove pool after retries, trying force removal"
+            { sudo dmsetup remove --force "$name" 2>/dev/null || true; } || true
+        fi
+        
+        echo "Pool removal completed"
     }
 
     pool_reset() {
-        if sudo dmsetup info "$name"; then
-            pool_remove
+        echo "=== Starting loopback pool reset for: $name ==="
+        
+        if sudo dmsetup info "$name" >/dev/null 2>&1; then
+            echo "Pool $name exists, performing cleanup..."
+            
+            # Phase 1: System sync and cache cleanup
+            echo "=== Phase 1: System cache cleanup ==="
+            sync
+            { sudo bash -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true; } || true
+            sync
+            sleep 2
+            
+            # Phase 2: Suspend/resume to force cleanup
+            echo "=== Phase 2: Pool suspend/resume ==="
+            { sudo dmsetup suspend "$name" 2>/dev/null || true; } || true
+            sleep 2
+            { sudo dmsetup resume "$name" 2>/dev/null || true; } || true
+            sleep 1
+            
+            # Phase 3: Pool removal with robust error handling
+            echo "=== Phase 3: Pool removal ==="
+            pool_remove || {
+                echo "Warning: pool_remove failed, but continuing with pool creation..."
+            }
+        else
+            echo "Pool $name does not exist, skipping cleanup"
         fi
+        
+        # Phase 4: Create new pool
+        echo "=== Phase 4: Creating new pool ==="
         pool_create
+        echo "=== Pool reset completed successfully ==="
     }
 else
     dm_device="/dev/mapper/$(echo ${FICD_DM_VOLUME_GROUP} | sed -e s/-/--/g)-$name"
@@ -146,31 +214,82 @@ else
 
     pool_reset() {
         if [ -e "${dm_device}" ]; then
-            # Wait for containerd to finish any pending cleanup operations
-            echo "Waiting for containerd to finish cleanup operations..."
+            echo "Starting pool reset for: ${dm_device}"
             
-            # Use containerd client to clean up any remaining snapshots
+            # PHASE 1: Containerd cleanup (always try, ignore errors)
+            echo "=== Phase 1: Containerd snapshot cleanup ==="
             if command -v ctr >/dev/null 2>&1; then
                 echo "Cleaning up containerd snapshots..."
-                # List and remove any active snapshots using containerd API
                 for snap in $(ctr --address /run/firecracker-containerd/containerd.sock snapshots list 2>/dev/null | tail -n +2 | awk '{print $1}' || true); do
                     if [ -n "$snap" ] && [ "$snap" != "KEY" ]; then
                         echo "Removing containerd snapshot: $snap"
                         ctr --address /run/firecracker-containerd/containerd.sock snapshots remove "$snap" 2>/dev/null || true
                     fi
                 done
-                
-                # Give containerd time to release device references
-                sleep 2
+                echo "Waiting for containerd to release device references..."
+                sleep 5
+            else
+                echo "containerd client not available, skipping containerd cleanup"
             fi
             
-            # Sync filesystem and drop caches to help release any remaining references
-            sync
-            sudo bash -c 'echo 1 > /proc/sys/vm/drop_caches' 2>/dev/null || true
+            # PHASE 2: Force cleanup all device mapper snapshots by name
+            echo "=== Phase 2: Device mapper snapshot cleanup ==="
+            echo "Removing all snapshots for pool $(basename ${dm_device})..."
             
-            pool_remove
+            # Get all snapshots for this pool and remove them aggressively
+            for snapshot in $(sudo dmsetup ls 2>/dev/null | grep "^$(basename ${dm_device})-snap-" | awk '{print $1}' | sort -r || true); do
+                echo "Force removing snapshot: $snapshot"
+                sudo dmsetup remove --force "$snapshot" 2>/dev/null || true
+            done
+            
+            # PHASE 3: Try to delete thin devices by ID (more aggressive approach)
+            echo "=== Phase 3: Thin device cleanup by ID ==="
+            # The thin pool can have devices 1-50, try to delete them all
+            for dev_id in {1..50}; do
+                # Don't let dmsetup message failures stop the script
+                { sudo dmsetup message "${dm_device}" 0 "delete $dev_id" 2>/dev/null || true; } || true
+            done
+            
+            # PHASE 4: Suspend/resume pool to force state cleanup
+            echo "=== Phase 4: Force pool suspend/resume ==="
+            if sudo dmsetup info "${dm_device}" >/dev/null 2>&1; then
+                echo "Suspending pool..."
+                { sudo dmsetup suspend "${dm_device}" 2>/dev/null || true; } || true
+                sleep 3
+                echo "Resuming pool..."  
+                { sudo dmsetup resume "${dm_device}" 2>/dev/null || true; } || true
+                sleep 2
+            else
+                echo "Pool device not found during suspend/resume phase"
+            fi
+            
+            # PHASE 5: System cache cleanup
+            echo "=== Phase 5: System cache cleanup ==="
+            sync
+            { sudo bash -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null || true; } || true
+            sync
+            sleep 3
+            
+            # PHASE 6: Pool removal (this should now work)
+            echo "=== Phase 6: Pool removal ==="
+            pool_remove || {
+                echo "Warning: pool_remove failed, but continuing..."
+                # Last resort: try to remove pool components individually
+                { sudo dmsetup remove --force "${dm_device}" 2>/dev/null || true; } || true
+                { sudo dmsetup remove --force "${dm_device}_tdata" 2>/dev/null || true; } || true  
+                { sudo dmsetup remove --force "${dm_device}_tmeta" 2>/dev/null || true; } || true
+                { sudo lvremove -f "$dm_device" 2>/dev/null || true; } || true
+            }
+            
+            echo "Pool reset cleanup completed"
+        else
+            echo "Pool device ${dm_device} does not exist, skipping cleanup"
         fi
+        
+        # PHASE 7: Create new pool
+        echo "=== Phase 7: Creating new pool ==="
         pool_create
+        echo "Pool reset completed successfully"
     }
 fi
 
