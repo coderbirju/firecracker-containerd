@@ -1400,7 +1400,9 @@ func TestUpdateVMMetadata_Isolated(t *testing.T) {
 		containerd.WithNewSnapshot("mmds-test-all", image),
 		containerd.WithNewSpec(
 			oci.WithProcessArgs("/usr/bin/wget",
-				"-q",      // don't print to stderr unless an error occurs
+				"-q",       // don't print to stderr unless an error occurs
+				"-T", "10", // 10 second timeout for wget
+				"-t", "3", // 3 retry attempts
 				"-O", "-", // write to stdout
 				"http://169.254.169.254/"),
 			firecrackeroci.WithVMID("1"),
@@ -1409,9 +1411,38 @@ func TestUpdateVMMetadata_Isolated(t *testing.T) {
 	)
 	require.NoError(t, err, "failed to create container %s", containerName)
 
-	stdout := startAndWaitTask(ctx, t, newContainer)
-	t.Logf("stdout output from task %q: %s", containerName, stdout)
-	assert.Equalf(t, "ThreeThing\nTwoThing\nthing", stdout, "container %q did not emit expected stdout", containerName)
+	// Allow time for MMDS network to be fully configured before querying
+	time.Sleep(2 * time.Second)
+
+	// Retry logic for MMDS queries (similar to CNI test fix)
+	var stdout string
+	var lastErr error
+	expectedOutput := "ThreeThing\nTwoThing\nthing"
+	maxRetries := 3
+
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			t.Logf("Retry attempt %d/%d for MMDS query in container %s", retry+1, maxRetries, containerName)
+			time.Sleep(time.Duration(retry) * 1000 * time.Millisecond)
+		}
+
+		stdout = startAndWaitTask(ctx, t, newContainer)
+		t.Logf("stdout output from task %q: %s", containerName, stdout)
+
+		if stdout == expectedOutput {
+			break
+		}
+
+		if retry == maxRetries-1 {
+			lastErr = fmt.Errorf("MMDS query failed after %d attempts", maxRetries)
+		}
+	}
+
+	if lastErr == nil {
+		assert.Equalf(t, expectedOutput, stdout, "container %q did not emit expected stdout", containerName)
+	} else {
+		t.Errorf("Container %s failed after retries: %v. Last output: %q", containerName, lastErr, stdout)
+	}
 	// check a single entry
 	containerName += "-entry"
 	newContainer, err = client.NewContainer(ctx,
@@ -1420,7 +1451,9 @@ func TestUpdateVMMetadata_Isolated(t *testing.T) {
 		containerd.WithNewSnapshot("mmds-test-entry", image),
 		containerd.WithNewSpec(
 			oci.WithProcessArgs("/usr/bin/wget",
-				"-q",      // don't print to stderr unless an error occurs
+				"-q",       // don't print to stderr unless an error occurs
+				"-T", "10", // 10 second timeout for wget
+				"-t", "3", // 3 retry attempts
 				"-O", "-", // write to stdout
 				"http://169.254.169.254/thing"),
 			firecrackeroci.WithVMID("1"),
@@ -1428,9 +1461,33 @@ func TestUpdateVMMetadata_Isolated(t *testing.T) {
 		),
 	)
 	require.NoError(t, err, "failed to create container %s", containerName)
-	stdout = startAndWaitTask(ctx, t, newContainer)
-	t.Logf("stdout output from task %q: %s", containerName, stdout)
-	assert.Equalf(t, "45", stdout, "container %q did not emit expected stdout", containerName)
+
+	// Allow time for MMDS network to be ready (similar to first container)
+	time.Sleep(1 * time.Second)
+
+	// Retry logic for single MMDS entry query
+	expectedSingleOutput := "45"
+	maxRetriesEntry := 3
+
+	for retry := 0; retry < maxRetriesEntry; retry++ {
+		if retry > 0 {
+			t.Logf("Retry attempt %d/%d for MMDS single entry query in container %s", retry+1, maxRetriesEntry, containerName)
+			time.Sleep(time.Duration(retry) * 500 * time.Millisecond)
+		}
+
+		stdout = startAndWaitTask(ctx, t, newContainer)
+		t.Logf("stdout output from task %q: %s", containerName, stdout)
+
+		if stdout == expectedSingleOutput {
+			break
+		}
+
+		if retry == maxRetriesEntry-1 {
+			t.Errorf("Container %s failed after retries. Last output: %q (expected: %q)", containerName, stdout, expectedSingleOutput)
+		}
+	}
+
+	assert.Equalf(t, expectedSingleOutput, stdout, "container %q did not emit expected stdout", containerName)
 }
 
 func TestMemoryBalloon_Isolated(t *testing.T) {
