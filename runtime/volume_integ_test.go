@@ -203,7 +203,7 @@ func testVolumeFrom(t *testing.T, runtime string) {
 	require.NoError(t, err, "failed to create fccontrol client")
 
 	// TODO: Create and host own images with non-empty volumes.
-	ref := "docker.io/library/postgres:14.3"
+	ref := "public.ecr.aws/docker/library/postgres:14.3"
 	vs := volume.NewSet(runtime)
 	provider := volume.FromImage(client, ref, "vfc-snapshot", volume.WithSnapshotter(defaultSnapshotterName))
 	defer func() {

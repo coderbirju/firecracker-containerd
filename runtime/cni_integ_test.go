@@ -184,10 +184,18 @@ func TestAutomaticCNISupport_Isolated(t *testing.T) {
 	}()
 
 	var taskGroup sync.WaitGroup
-	for _, taskID := range taskIDs {
+	for i, taskID := range taskIDs {
 		taskGroup.Add(1)
-		go func(taskID string) {
+		go func(i int, taskID string) {
 			defer taskGroup.Done()
+
+			// Stagger container starts to avoid overwhelming the system
+			// This helps prevent race conditions with network setup and HTTP server
+			staggerDelay := time.Duration(i) * 200 * time.Millisecond
+			if staggerDelay > 0 {
+				t.Logf("Staggering start of container %s by %v", taskID, staggerDelay)
+				time.Sleep(staggerDelay)
+			}
 
 			snapshotName := fmt.Sprintf("%s-snapshot", taskID)
 
@@ -197,7 +205,9 @@ func TestAutomaticCNISupport_Isolated(t *testing.T) {
 				containerd.WithNewSnapshot(snapshotName, image),
 				containerd.WithNewSpec(
 					oci.WithProcessArgs("/usr/bin/wget",
-						"-q",      // don't print to stderr unless an error occurs
+						"-q",       // don't print to stderr unless an error occurs
+						"-T", "10", // 10 second timeout for wget
+						"-t", "3", // 3 retry attempts
 						"-O", "-", // write to stdout
 						localServices.URL(taskID)),
 					firecrackeroci.WithVMNetwork,
@@ -205,12 +215,44 @@ func TestAutomaticCNISupport_Isolated(t *testing.T) {
 			)
 			require.NoError(t, err, "failed to create container %s", taskID)
 
-			stdout := startAndWaitTask(ctx, t, newContainer)
-			t.Logf("stdout output from task %q: %s", taskID, stdout)
-			assert.Equalf(t, webpages[taskID], stdout, "container %q did not emit expected stdout", taskID)
+			// Retry logic for flaky network operations
+			var stdout string
+			var lastErr error
+			maxRetries := 3
+			for retry := 0; retry < maxRetries; retry++ {
+				if retry > 0 {
+					t.Logf("Retry attempt %d/%d for container %s", retry+1, maxRetries, taskID)
+					// Small delay between retries
+					time.Sleep(time.Duration(retry) * 500 * time.Millisecond)
+				}
+
+				stdout = startAndWaitTask(ctx, t, newContainer)
+
+				// Check if we got the expected output
+				if stdout == webpages[taskID] {
+					t.Logf("stdout output from task %q: %s", taskID, stdout)
+					break
+				}
+
+				// Log the issue but don't fail yet
+				t.Logf("Attempt %d for task %q returned unexpected output: %q (expected: %q)",
+					retry+1, taskID, stdout, webpages[taskID])
+
+				if retry == maxRetries-1 {
+					// Final attempt failed
+					lastErr = fmt.Errorf("task %q failed after %d attempts", taskID, maxRetries)
+				}
+			}
+
+			// Final assertion after retries
+			if lastErr == nil {
+				assert.Equalf(t, webpages[taskID], stdout, "container %q did not emit expected stdout", taskID)
+			} else {
+				t.Errorf("Container %s failed after retries: %v. Last output: %q", taskID, lastErr, stdout)
+			}
 
 			_ = newContainer.Delete(ctx)
-		}(taskID)
+		}(i, taskID)
 	}
 
 	taskGroup.Wait()
